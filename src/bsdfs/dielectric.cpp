@@ -13,7 +13,7 @@ Smooth dielectric material (:monosp:`dielectric`)
 -------------------------------------------------
 
 .. pluginparameters::
- :extra-rows: 4
+ :extra-rows: 6
 
  * - int_ior
    - |float| or |string|
@@ -22,6 +22,28 @@ Smooth dielectric material (:monosp:`dielectric`)
  * - ext_ior
    - |float| or |string|
    - Exterior index of refraction specified numerically or using a known material name.  (Default: air / 1.000277)
+
+ * - abbe
+   - |float|
+   - Optional Abbe number :math:`V` of the interface (dimensionless). Enables
+     wavelength-dependent refraction in spectral variants. Lower values give
+     stronger dispersion: :math:`V \approx 60` is crown-glass-like,
+     :math:`V \approx 35` is flint-like, :math:`V \approx 20` is
+     heavy-flint / "diamond fire". Internally converted to ``cauchy_b`` via
+     :math:`B = (\eta_0 - 1) / (1.9085\,V)`. Mutually exclusive with
+     ``cauchy_b``. Ignored in RGB / monochromatic variants.
+     (Default: 0, no dispersion)
+
+ * - cauchy_b
+   - |float|
+   - Cauchy dispersion coefficient :math:`B` (in :math:`\mu m^2`), for users
+     who want to specify dispersion directly. When nonzero in a spectral
+     variant, the relative index of refraction varies with wavelength as
+     :math:`\eta(\lambda) = \eta_0 + B\,(1/\lambda^2 - 1/\lambda_\text{ref}^2)`,
+     with :math:`\lambda_\text{ref} = 0.5893\,\mu m` (sodium D line).
+     ``int_ior`` / ``ext_ior`` then describe the refractive index at
+     :math:`\lambda_\text{ref}`. Mutually exclusive with ``abbe``. Ignored in
+     RGB / monochromatic variants. (Default: 0, no dispersion)
 
  * - specular_reflectance
    - |spectrum| or |texture|
@@ -130,6 +152,45 @@ In *polarized* rendering modes, the material automatically switches to a polariz
 implementation of the underlying Fresnel equations that quantify the reflectance and
 transmission.
 
+Dispersion (spectral variants only)
+***********************************
+
+Passing a nonzero ``abbe`` (or ``cauchy_b``) enables wavelength-dependent
+refraction via Cauchy's two-term equation. The ``abbe`` parameter is the
+recommended entry point: it is dimensionless, matches values listed in glass
+datasheets, and has an intuitive range.
+
+Typical Abbe numbers:
+
+.. list-table::
+    :widths: 25 25 50
+    :header-rows: 1
+
+    * - :math:`V`
+      - Character
+      - Real-world analog
+    * - 80–95
+      - Nearly achromatic
+      - Fluorite, fluorocrown
+    * - 55–70
+      - Subtle rainbow
+      - BK7, water (:math:`V \approx 55`)
+    * - 35–55
+      - Visible rainbow
+      - Ordinary flint glass
+    * - 20–35
+      - "Fire"
+      - Heavy flint, cut crystal
+    * - 12–20
+      - Strong "diamond fire"
+      - Diamond
+
+Sampling uses a hero-wavelength scheme: one wavelength drives the refracted
+direction, and the remaining wavelengths in the packet are masked out on
+transmission. This trades variance (dispersive paths have higher variance per
+sample) for an unbiased estimate. Reflection is wavelength-independent and
+all wavelengths in the packet contribute.
+
 Instead of specifying numerical values for the indices of refraction, Mitsuba 3
 comes with a list of presets that can be specified with the :paramtype:`material`
 parameter:
@@ -221,6 +282,28 @@ public:
 
         m_eta = int_ior / ext_ior;
 
+        /* Optional dispersion. Users can either specify the Cauchy coefficient
+           B directly (cauchy_b, in μm²), or the Abbe number of the interface
+           (abbe, dimensionless), which is more intuitive and matches values
+           listed in glass datasheets. When abbe is given, it is converted to
+           B via B = (m_eta - 1) / (K * abbe), where
+           K = 1/λ_F² - 1/λ_C² ≈ 1.9085 μm⁻² with λ_F = 0.48613 μm and
+           λ_C = 0.65627 μm (Fraunhofer F and C lines). The two parameters
+           are mutually exclusive. Both are ignored in RGB / monochromatic
+           variants. */
+        ScalarFloat cauchy_b = props.get<ScalarFloat>("cauchy_b", 0.f);
+        ScalarFloat abbe     = props.get<ScalarFloat>("abbe", 0.f);
+
+        if (cauchy_b != 0.f && abbe != 0.f)
+            Throw("Specify either 'cauchy_b' or 'abbe', not both.");
+        if (abbe < 0.f)
+            Throw("'abbe' must be positive (got %f).", abbe);
+
+        if (abbe != 0.f)
+            cauchy_b = (m_eta - 1.f) / (1.9085f * abbe);
+
+        m_cauchy_b = cauchy_b;
+
         if (props.has_property("specular_reflectance"))
             m_specular_reflectance   = props.get_texture<Texture>("specular_reflectance", 1.f);
         if (props.has_property("specular_transmittance"))
@@ -242,6 +325,28 @@ public:
             cb->put("specular_transmittance", m_specular_transmittance, ParamFlags::Differentiable);
     }
 
+    /// Per-wavelength eta via Cauchy's equation around the sodium D line.
+    UnpolarizedSpectrum eval_eta(const Wavelength &wavelengths) const {
+        if constexpr (is_spectral_v<Spectrum>) {
+            if (m_cauchy_b != 0.f) {
+                UnpolarizedSpectrum lambda_um = wavelengths * ScalarFloat(1e-3f);
+                UnpolarizedSpectrum inv_lambda_sq = dr::rcp(dr::square(lambda_um));
+                ScalarFloat lambda_ref = 0.5893f;
+                ScalarFloat inv_ref_sq = 1.f / (lambda_ref * lambda_ref);
+                return m_eta + m_cauchy_b * (inv_lambda_sq - inv_ref_sq);
+            }
+            DRJIT_MARK_USED(wavelengths);
+            return UnpolarizedSpectrum(m_eta);
+        } else {
+            DRJIT_MARK_USED(wavelengths);
+            return UnpolarizedSpectrum(m_eta);
+        }
+    }
+
+    bool has_dispersion() const {
+        return is_spectral_v<Spectrum> && m_cauchy_b != 0.f;
+    }
+
     std::pair<BSDFSample3f, Spectrum> sample(const BSDFContext &ctx,
                                              const SurfaceInteraction3f &si,
                                              Float sample1,
@@ -255,8 +360,25 @@ public:
         // Evaluate the Fresnel equations for unpolarized illumination
         Float cos_theta_i = Frame3f::cos_theta(si.wi);
 
-        auto [r_i, cos_theta_t, eta_it, eta_ti] = fresnel(cos_theta_i, Float(m_eta));
+        /* Per-wavelength relative IOR. Equals m_eta everywhere unless the
+           user enabled Cauchy dispersion in a spectral variant. The hero
+           wavelength (lane 0) drives the sampled direction and lobe choice;
+           the remaining lanes contribute via weight scaling (reflection) or
+           are masked out (transmission). */
+        UnpolarizedSpectrum eta_spec = eval_eta(si.wavelengths);
+        Float eta_hero = has_dispersion() ? Float(eta_spec[0]) : Float(m_eta);
+
+        auto [r_i, cos_theta_t, eta_it, eta_ti] = fresnel(cos_theta_i, eta_hero);
         Float t_i = 1.f - r_i;
+
+        UnpolarizedSpectrum r_i_spec(r_i), t_i_spec(t_i);
+        if (has_dispersion()) {
+            auto [r_s, cos_theta_t_s, eta_it_s, eta_ti_s] =
+                fresnel(UnpolarizedSpectrum(cos_theta_i), eta_spec);
+            (void) cos_theta_t_s; (void) eta_it_s; (void) eta_ti_s;
+            r_i_spec = r_s;
+            t_i_spec = 1.f - r_s;
+        }
 
         // Lobe selection
         BSDFSample3f bs = dr::zeros<BSDFSample3f>();
@@ -301,8 +423,8 @@ public:
 
             /* BSDF weights are Mueller matrices now. */
             Float cos_theta_o_hat = Frame3f::cos_theta(wo_hat);
-            Spectrum R = mueller::specular_reflection(UnpolarizedSpectrum(cos_theta_o_hat), UnpolarizedSpectrum(m_eta)),
-                     T = mueller::specular_transmission(UnpolarizedSpectrum(cos_theta_o_hat), UnpolarizedSpectrum(m_eta));
+            Spectrum R = mueller::specular_reflection(UnpolarizedSpectrum(cos_theta_o_hat), eta_spec),
+                     T = mueller::specular_transmission(UnpolarizedSpectrum(cos_theta_o_hat), eta_spec);
 
             if (likely(has_reflection && has_transmission)) {
                 weight = dr::select(selected_r, R, T) / bs.pdf;
@@ -348,8 +470,28 @@ public:
                         weight = dr::select(selected_r, r_diff, t_diff);
                     }
                 }
+
+                if (has_dispersion()) {
+                    /* Hero wavelength drove the lobe decision with probability r_hero.
+                       Reflection: all wavelengths share the sampled direction, so each
+                       lane receives r_λ / r_hero. Transmission: only the hero wavelength
+                       refracts into the sampled direction — the other lanes are killed. */
+                    UnpolarizedSpectrum w_r = r_i_spec / dr::detach(r_i);
+                    UnpolarizedSpectrum w_t = dr::zeros<UnpolarizedSpectrum>();
+                    w_t[0] = t_i_spec[0] / dr::detach(t_i);
+                    weight = dr::select(selected_r, Spectrum(w_r), Spectrum(w_t));
+                }
             } else if (has_reflection || has_transmission) {
                 weight = has_reflection ? r_i : t_i;
+                if (has_dispersion()) {
+                    if (has_reflection) {
+                        weight = Spectrum(r_i_spec);
+                    } else {
+                        UnpolarizedSpectrum w_t = dr::zeros<UnpolarizedSpectrum>();
+                        w_t[0] = t_i_spec[0];
+                        weight = Spectrum(w_t);
+                    }
+                }
             }
 
             if (dr::any_or<true>(selected_r))
@@ -386,18 +528,21 @@ public:
             oss << "  specular_reflectance = " << string::indent(m_specular_reflectance) << "," << std::endl;
         if (m_specular_transmittance)
             oss << "  specular_transmittance = " << string::indent(m_specular_transmittance) << ", " << std::endl;
-        oss << "  eta = " << m_eta << "," << std::endl
-            << "]";
+        oss << "  eta = " << m_eta << "," << std::endl;
+        if (m_cauchy_b != 0.f)
+            oss << "  cauchy_b = " << m_cauchy_b << "," << std::endl;
+        oss << "]";
         return oss.str();
     }
 
     MI_DECLARE_CLASS(SmoothDielectric)
 private:
     ScalarFloat m_eta;
+    ScalarFloat m_cauchy_b;
     ref<Texture> m_specular_reflectance;
     ref<Texture> m_specular_transmittance;
 
-    MI_TRAVERSE_CB(Base, m_eta, m_specular_reflectance,m_specular_transmittance)
+    MI_TRAVERSE_CB(Base, m_eta, m_cauchy_b, m_specular_reflectance, m_specular_transmittance)
 };
 
 MI_EXPORT_PLUGIN(SmoothDielectric)

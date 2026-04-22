@@ -158,6 +158,51 @@ def test05_spot_check(variant_scalar_rgb):
     assert dr.allclose(bs.wo, wi)
 
 
+def test07_dispersion_construct(variant_scalar_rgb):
+    # Both abbe and cauchy_b should accept and instantiate in any variant
+    # (they are silently inert in non-spectral variants).
+    for params in [{'abbe': 50.0}, {'cauchy_b': 0.0042}]:
+        b = mi.load_dict({'type': 'dielectric', 'int_ior': 1.5, **params})
+        assert b is not None
+
+    # Mutual exclusion: passing both should raise.
+    with pytest.raises(RuntimeError):
+        mi.load_dict({'type': 'dielectric', 'abbe': 50.0, 'cauchy_b': 0.004})
+
+    # Negative abbe should raise.
+    with pytest.raises(RuntimeError):
+        mi.load_dict({'type': 'dielectric', 'abbe': -10.0})
+
+
+def test08_dispersion_spectral(variant_scalar_spectral):
+    """In a spectral variant, an abbe-enabled BSDF should produce
+    wavelength-dependent transmission directions when refracting."""
+    bsdf = mi.load_dict({'type': 'dielectric', 'int_ior': 1.5, 'abbe': 30.0})
+    bsdf_no_disp = mi.load_dict({'type': 'dielectric', 'int_ior': 1.5})
+
+    si = mi.SurfaceInteraction3f()
+    angle = 30 * dr.pi / 180
+    si.wi = [dr.sin(angle), 0, dr.cos(angle)]
+    # Use wavelengths far from the 589.3 nm reference so the dispersive
+    # eta differs noticeably from m_eta. Lane 0 (the hero) gets 450 nm.
+    si.wavelengths = [450.0, 550.0, 650.0, 700.0]
+
+    ctx = mi.BSDFContext()
+
+    # Force transmission by sampling at high probability.
+    bs_disp,    _ = bsdf.sample(ctx, si, 1.0, [0, 0])
+    bs_no_disp, _ = bsdf_no_disp.sample(ctx, si, 1.0, [0, 0])
+
+    assert bs_disp.sampled_type    == +mi.BSDFFlags.DeltaTransmission
+    assert bs_no_disp.sampled_type == +mi.BSDFFlags.DeltaTransmission
+
+    # The dispersive bsdf at 450 nm refracts more strongly than 1.5,
+    # so the refracted z-component should differ from the non-dispersive
+    # case (which uses eta = 1.5 across the board).
+    assert not dr.allclose(bs_disp.eta, bs_no_disp.eta)
+    assert bs_disp.eta > bs_no_disp.eta  # blue light bends more
+
+
 def test06_attached_sampling(variants_all_ad_rgb):
     bsdf = mi.load_dict({'type': 'dielectric'})
 
