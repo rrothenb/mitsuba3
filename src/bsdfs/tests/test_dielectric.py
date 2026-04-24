@@ -203,6 +203,70 @@ def test08_dispersion_spectral(variant_scalar_spectral):
     assert bs_disp.eta > bs_no_disp.eta  # blue light bends more
 
 
+def test09_thin_film_construct(variant_scalar_rgb):
+    # film params accepted in non-spectral variants but silently inert.
+    b = mi.load_dict({'type': 'dielectric', 'film_thickness': 300.0,
+                      'film_ior': 1.38})
+    assert b is not None
+
+    # film_ior accepted as material name, mirroring int_ior/ext_ior.
+    b = mi.load_dict({'type': 'dielectric', 'film_thickness': 200.0,
+                      'film_ior': 'water'})
+    assert b is not None
+
+    # Negative thickness rejected.
+    with pytest.raises(RuntimeError):
+        mi.load_dict({'type': 'dielectric', 'film_thickness': -10.0})
+
+
+def test10_thin_film_spectral(variant_scalar_spectral):
+    """In a spectral variant, an enabled thin film should produce a
+    wavelength-dependent reflectance weight on the reflection lobe;
+    the non-film case should be flat across wavelengths."""
+    # High-index film (TiO2-like) on glass: strong interference visible
+    # across the visible spectrum.
+    bsdf_film = mi.load_dict({
+        'type': 'dielectric', 'int_ior': 1.5,
+        'film_thickness': 400.0, 'film_ior': 2.4,
+    })
+    bsdf_no_film = mi.load_dict({'type': 'dielectric', 'int_ior': 1.5})
+
+    si = mi.SurfaceInteraction3f()
+    angle = 30 * dr.pi / 180
+    si.wi = [dr.sin(angle), 0, dr.cos(angle)]
+    # Span the visible range so phase φ differs noticeably across lanes.
+    si.wavelengths = [430.0, 510.0, 590.0, 670.0]
+
+    ctx = mi.BSDFContext()
+    ctx.type_mask = mi.BSDFFlags.DeltaReflection  # force reflection
+
+    _, w_film    = bsdf_film.sample(ctx, si, 0, [0, 0])
+    _, w_no_film = bsdf_no_film.sample(ctx, si, 0, [0, 0])
+
+    # Without a film, the reflection weight is the scalar Fresnel reflectance
+    # broadcast across all lanes — all four entries should match.
+    w_no_film_arr = mi.unpolarized_spectrum(w_no_film)
+    assert dr.allclose(w_no_film_arr[0], w_no_film_arr[1])
+    assert dr.allclose(w_no_film_arr[0], w_no_film_arr[3])
+
+    # With a high-index film, the Airy formula produces a strongly
+    # wavelength-dependent reflectance.
+    w_film_arr = mi.unpolarized_spectrum(w_film)
+    spread = float(dr.max(w_film_arr) - dr.min(w_film_arr))
+    assert spread > 0.05, f'film reflectance should vary across λ; spread={spread}'
+
+
+def test11_thin_film_polarized_guard():
+    """If a polarized spectral variant is built, constructing a dielectric
+    with film_thickness > 0 should throw at construction time."""
+    polarized = [v for v in mi.variants() if 'polarized' in v and 'spectral' in v]
+    if not polarized:
+        pytest.skip('no polarized spectral variant in this build')
+    mi.set_variant(polarized[0])
+    with pytest.raises(RuntimeError):
+        mi.load_dict({'type': 'dielectric', 'film_thickness': 300.0})
+
+
 def test06_attached_sampling(variants_all_ad_rgb):
     bsdf = mi.load_dict({'type': 'dielectric'})
 

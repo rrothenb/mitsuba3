@@ -13,7 +13,7 @@ Smooth dielectric material (:monosp:`dielectric`)
 -------------------------------------------------
 
 .. pluginparameters::
- :extra-rows: 6
+ :extra-rows: 8
 
  * - int_ior
    - |float| or |string|
@@ -44,6 +44,23 @@ Smooth dielectric material (:monosp:`dielectric`)
      ``int_ior`` / ``ext_ior`` then describe the refractive index at
      :math:`\lambda_\text{ref}`. Mutually exclusive with ``abbe``. Ignored in
      RGB / monochromatic variants. (Default: 0, no dispersion)
+
+ * - film_thickness
+   - |float|
+   - Optional thickness of a single non-absorbing dielectric film coating the
+     interface, in nanometers. When nonzero in a spectral variant, the model
+     replaces the standard Fresnel reflectance with the Airy formula for an
+     ambient → film → substrate stack, producing wavelength-dependent
+     interference (iridescence). Typical values: 100–600 nm for AR coatings,
+     400–2000 nm for soap-film / oil-slick effects. Not yet supported in
+     polarized variants — instantiation throws if both are requested. Ignored
+     in RGB / monochromatic variants. (Default: 0, no film)
+
+ * - film_ior
+   - |float| or |string|
+   - Refractive index of the thin film, specified numerically or via a known
+     material name (same conventions as ``int_ior`` / ``ext_ior``). Only
+     consulted when ``film_thickness > 0``. (Default: air / 1.000277)
 
  * - specular_reflectance
    - |spectrum| or |texture|
@@ -191,6 +208,43 @@ transmission. This trades variance (dispersive paths have higher variance per
 sample) for an unbiased estimate. Reflection is wavelength-independent and
 all wavelengths in the packet contribute.
 
+Thin-film interference (spectral variants only)
+***********************************************
+
+Setting ``film_thickness`` (in nanometers) coats the interface with a single
+non-absorbing dielectric film of refractive index ``film_ior``. The reflectance
+becomes wavelength-dependent via the Airy formula for a thin layer, producing
+iridescence — the colored sheen of soap films, oil slicks, and anti-reflective
+coatings on lenses. Typical thickness ranges:
+
+.. list-table::
+    :widths: 25 25 50
+    :header-rows: 1
+
+    * - Thickness
+      - Effect
+      - Real-world analog
+    * - 100–200 nm
+      - Color shift, broad
+      - AR coatings (single-layer MgF₂)
+    * - 300–600 nm
+      - Strong color
+      - Soap films, oil on water
+    * - 600–2000 nm
+      - High-order rainbows
+      - Thicker soap films, peacock feathers
+    * - > 2000 nm
+      - Washes out
+      - Interference fringes too dense for the spectrum
+
+The film does not displace the refracted ray (films are vanishingly thin
+compared to the geometric ray), so refraction direction and ``bs.eta`` are
+determined by the substrate IOR alone. Thin-film and dispersion compose
+naturally — when both are enabled, the substrate IOR varies with wavelength
+inside the Airy formula. **Not yet supported in polarized variants**:
+constructing a dielectric with ``film_thickness > 0`` in a polarized variant
+throws.
+
 Instead of specifying numerical values for the indices of refraction, Mitsuba 3
 comes with a list of presets that can be specified with the :paramtype:`material`
 parameter:
@@ -304,6 +358,29 @@ public:
 
         m_cauchy_b = cauchy_b;
 
+        /* Optional thin-film interference. film_thickness is in nm; film_ior
+           is parsed the same way as int_ior/ext_ior and stored relative to
+           ext_ior so it lives in the same coordinate system as m_eta. The
+           polarized Mueller path does not yet handle thin-film phase shifts;
+           we throw rather than silently produce wrong polarization output. */
+        ScalarFloat film_thickness = props.get<ScalarFloat>("film_thickness", 0.f);
+        ScalarFloat film_ior_abs   = lookup_ior(props, "film_ior", "air");
+
+        if (film_thickness < 0.f)
+            Throw("'film_thickness' must be non-negative (got %f).", film_thickness);
+        if (film_ior_abs <= 0.f)
+            Throw("'film_ior' must be positive (got %f).", film_ior_abs);
+
+        if constexpr (is_polarized_v<Spectrum>) {
+            if (film_thickness > 0.f)
+                Throw("'film_thickness' is not yet supported in polarized "
+                      "variants. Use a non-polarized spectral variant for "
+                      "thin-film effects.");
+        }
+
+        m_film_thickness = film_thickness;
+        m_film_ior       = film_ior_abs / ext_ior;
+
         if (props.has_property("specular_reflectance"))
             m_specular_reflectance   = props.get_texture<Texture>("specular_reflectance", 1.f);
         if (props.has_property("specular_transmittance"))
@@ -347,6 +424,85 @@ public:
         return is_spectral_v<Spectrum> && m_cauchy_b != 0.f;
     }
 
+    bool has_thin_film() const {
+        return is_spectral_v<Spectrum> && !is_polarized_v<Spectrum> &&
+               m_film_thickness > 0.f;
+    }
+
+    /// True when any per-wavelength effect (dispersion or thin-film) is on,
+    /// i.e. when r_i_spec / t_i_spec must drive the unpolarized weight.
+    bool has_spectral_fresnel() const {
+        return has_dispersion() || has_thin_film();
+    }
+
+    /// Intensity reflectance per wavelength for a single non-absorbing film
+    /// (ambient → film → substrate stack), via the Airy formula. Refraction
+    /// direction is unaffected — only reflectance varies with λ.
+    UnpolarizedSpectrum thin_film_reflectance(
+            Float cos_theta_i,
+            const UnpolarizedSpectrum &eta_substrate,
+            const Wavelength &wavelengths) const {
+        if constexpr (is_spectral_v<Spectrum> && !is_polarized_v<Spectrum>) {
+            Float cos_a = dr::abs(cos_theta_i);
+            Float sin2_a = 1.f - dr::square(cos_a);
+
+            // Snell into the film. n_a = 1 by convention (film/substrate IORs
+            // are already expressed relative to the exterior medium).
+            ScalarFloat inv_nf_sq = 1.f / (m_film_ior * m_film_ior);
+            Float sin2_f = sin2_a * inv_nf_sq;
+            // If n_f < 1 and incidence is grazing, sin2_f could exceed 1 →
+            // TIR at the top interface. safe_sqrt clamps this; the resulting
+            // Airy value is degenerate but bounded.
+            Float cos_f = dr::safe_sqrt(1.f - sin2_f);
+
+            // Snell into the substrate, per wavelength.
+            UnpolarizedSpectrum inv_ns_sq = dr::rcp(dr::square(eta_substrate));
+            UnpolarizedSpectrum sin2_s = sin2_a * inv_ns_sq;
+            // TIR at substrate: full reflection regardless of film. Clamp the
+            // intermediate value to avoid NaN, then mask in the final answer.
+            auto tir = sin2_s >= 1.f;
+            sin2_s = dr::minimum(sin2_s, UnpolarizedSpectrum(1.f - 1e-7f));
+            UnpolarizedSpectrum cos_s = dr::safe_sqrt(1.f - sin2_s);
+
+            // Fresnel amplitude reflection coefficients at each interface.
+            // Top (ambient → film): n_a = 1.
+            Float r01_s = (cos_a - m_film_ior * cos_f) /
+                          (cos_a + m_film_ior * cos_f);
+            Float r01_p = (m_film_ior * cos_a - cos_f) /
+                          (m_film_ior * cos_a + cos_f);
+            // Bottom (film → substrate), per wavelength.
+            UnpolarizedSpectrum r12_s = (m_film_ior * cos_f - eta_substrate * cos_s) /
+                                        (m_film_ior * cos_f + eta_substrate * cos_s);
+            UnpolarizedSpectrum r12_p = (eta_substrate * cos_f - m_film_ior * cos_s) /
+                                        (eta_substrate * cos_f + m_film_ior * cos_s);
+
+            // Phase accumulated by one round-trip through the film:
+            //   φ = 4π · n_f · d · cos(θ_f) / λ
+            // d and λ both in nm → unitless φ.
+            UnpolarizedSpectrum phi =
+                (4.f * dr::Pi<ScalarFloat>) * m_film_ior * m_film_thickness *
+                cos_f * dr::rcp(wavelengths);
+            UnpolarizedSpectrum cos_phi = dr::cos(phi);
+
+            // Airy intensity reflectance per polarization.
+            auto airy = [&](Float r01, const UnpolarizedSpectrum &r12) {
+                UnpolarizedSpectrum r01_sq(r01 * r01);
+                UnpolarizedSpectrum r12_sq = dr::square(r12);
+                UnpolarizedSpectrum two_r  = 2.f * r01 * r12 * cos_phi;
+                return (r01_sq + r12_sq + two_r) /
+                       (1.f + r01_sq * r12_sq + two_r);
+            };
+
+            UnpolarizedSpectrum R = 0.5f * (airy(r01_s, r12_s) + airy(r01_p, r12_p));
+            return dr::select(tir, UnpolarizedSpectrum(1.f), R);
+        } else {
+            DRJIT_MARK_USED(cos_theta_i);
+            DRJIT_MARK_USED(eta_substrate);
+            DRJIT_MARK_USED(wavelengths);
+            return UnpolarizedSpectrum(0.f);  // unreachable: has_thin_film() is false
+        }
+    }
+
     std::pair<BSDFSample3f, Spectrum> sample(const BSDFContext &ctx,
                                              const SurfaceInteraction3f &si,
                                              Float sample1,
@@ -378,6 +534,19 @@ public:
             (void) cos_theta_t_s; (void) eta_it_s; (void) eta_ti_s;
             r_i_spec = r_s;
             t_i_spec = 1.f - r_s;
+        }
+
+        /* Thin-film interference, if enabled, replaces the per-wavelength
+           reflectance with the Airy formula. cos_theta_t / eta_it / eta_ti
+           are unaffected — the film is too thin to displace the refracted
+           ray, so refraction direction is set by substrate IOR alone. */
+        if (has_thin_film()) {
+            UnpolarizedSpectrum r_film =
+                thin_film_reflectance(cos_theta_i, eta_spec, si.wavelengths);
+            r_i_spec = r_film;
+            t_i_spec = 1.f - r_film;
+            r_i = Float(r_film[0]);  // hero λ drives lobe choice
+            t_i = 1.f - r_i;
         }
 
         // Lobe selection
@@ -471,7 +640,7 @@ public:
                     }
                 }
 
-                if (has_dispersion()) {
+                if (has_spectral_fresnel()) {
                     /* Hero wavelength drove the lobe decision with probability r_hero.
                        Reflection: all wavelengths share the sampled direction, so each
                        lane receives r_λ / r_hero. Transmission: only the hero wavelength
@@ -483,7 +652,7 @@ public:
                 }
             } else if (has_reflection || has_transmission) {
                 weight = has_reflection ? r_i : t_i;
-                if (has_dispersion()) {
+                if (has_spectral_fresnel()) {
                     if (has_reflection) {
                         weight = Spectrum(r_i_spec);
                     } else {
@@ -531,6 +700,9 @@ public:
         oss << "  eta = " << m_eta << "," << std::endl;
         if (m_cauchy_b != 0.f)
             oss << "  cauchy_b = " << m_cauchy_b << "," << std::endl;
+        if (m_film_thickness > 0.f)
+            oss << "  film_thickness = " << m_film_thickness << " nm," << std::endl
+                << "  film_ior = " << m_film_ior << "," << std::endl;
         oss << "]";
         return oss.str();
     }
@@ -539,10 +711,13 @@ public:
 private:
     ScalarFloat m_eta;
     ScalarFloat m_cauchy_b;
+    ScalarFloat m_film_thickness;
+    ScalarFloat m_film_ior;
     ref<Texture> m_specular_reflectance;
     ref<Texture> m_specular_transmittance;
 
-    MI_TRAVERSE_CB(Base, m_eta, m_cauchy_b, m_specular_reflectance, m_specular_transmittance)
+    MI_TRAVERSE_CB(Base, m_eta, m_cauchy_b, m_film_thickness, m_film_ior,
+                   m_specular_reflectance, m_specular_transmittance)
 };
 
 MI_EXPORT_PLUGIN(SmoothDielectric)
