@@ -210,3 +210,61 @@ def test02_sample_pol_world(variant_scalar_mono_polarized):
     # Test that the polarization is flipped to right circular
     a6 = M_world @ spectrum_from_stokes([1, 0, 0, -1])
     assert dr.all(a6[3, 0] > mi.UnpolarizedSpectrum(0.0))
+
+
+def test03_thin_film_construct(variant_scalar_rgb):
+    # Film params accepted in non-spectral variants but silently inert.
+    b = mi.load_dict({'type': 'conductor', 'material': 'Au',
+                      'film_thickness': 100.0, 'film_ior': 1.38})
+    assert b is not None
+
+    # film_ior accepted as material name.
+    b = mi.load_dict({'type': 'conductor', 'material': 'Cu',
+                      'film_thickness': 200.0, 'film_ior': 'water'})
+    assert b is not None
+
+    # Negative thickness rejected.
+    with pytest.raises(RuntimeError):
+        mi.load_dict({'type': 'conductor', 'material': 'Cu',
+                      'film_thickness': -10.0})
+
+
+def test04_thin_film_spectral(variant_scalar_spectral):
+    """In a spectral variant, an enabled thin film should change the
+    conductor's spectral reflectance signature (the difference vs the
+    no-film case must vary with wavelength)."""
+    bsdf_film = mi.load_dict({
+        'type': 'conductor', 'material': 'Al',
+        'film_thickness': 200.0, 'film_ior': 1.38,
+    })
+    bsdf_no_film = mi.load_dict({'type': 'conductor', 'material': 'Al'})
+
+    si = mi.SurfaceInteraction3f()
+    angle = 30 * dr.pi / 180
+    si.wi = [dr.sin(angle), 0, dr.cos(angle)]
+    si.wavelengths = [430.0, 510.0, 590.0, 670.0]
+    ctx = mi.BSDFContext()
+
+    _, w_film    = bsdf_film.sample(ctx, si, 0, [0, 0])
+    _, w_no_film = bsdf_no_film.sample(ctx, si, 0, [0, 0])
+
+    w_film_arr    = mi.unpolarized_spectrum(w_film)
+    w_no_film_arr = mi.unpolarized_spectrum(w_no_film)
+
+    # The film modulates Al's already-varying reflectance differently at
+    # each wavelength — the film/no-film difference should not be uniform.
+    delta = w_film_arr - w_no_film_arr
+    delta_spread = float(dr.max(delta) - dr.min(delta))
+    assert delta_spread > 0.02, \
+        f'film should change spectral signature non-uniformly; spread={delta_spread}'
+
+
+def test05_thin_film_polarized_guard():
+    """A polarized spectral variant should reject thin-film at construction."""
+    polarized = [v for v in mi.variants() if 'polarized' in v and 'spectral' in v]
+    if not polarized:
+        pytest.skip('no polarized spectral variant in this build')
+    mi.set_variant(polarized[0])
+    with pytest.raises(RuntimeError):
+        mi.load_dict({'type': 'conductor', 'material': 'Au',
+                      'film_thickness': 200.0})
