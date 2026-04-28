@@ -294,3 +294,81 @@ def test15_thin_film_spectral(variant_scalar_spectral):
     # Film: clearly varies across lanes.
     spread = float(dr.max(w_film_arr) - dr.min(w_film_arr))
     assert spread > 0.05, f'film reflectance should vary; spread={spread}'
+
+
+def test16_dispersion_construct(variant_scalar_rgb):
+    # abbe / cauchy_b accept and instantiate (silently inert in RGB).
+    for params in [{'abbe': 30.0}, {'cauchy_b': 0.005}]:
+        b = mi.load_dict({'type': 'roughdielectric', 'alpha': 0.05,
+                          'int_ior': 1.5, **params})
+        assert b is not None
+
+    # Mutual exclusion.
+    with pytest.raises(RuntimeError):
+        mi.load_dict({'type': 'roughdielectric', 'abbe': 30.0,
+                      'cauchy_b': 0.005})
+
+    # Negative abbe rejected.
+    with pytest.raises(RuntimeError):
+        mi.load_dict({'type': 'roughdielectric', 'abbe': -10.0})
+
+
+def test17_dispersion_spectral(variant_scalar_spectral):
+    """In a spectral variant with dispersion, force a glancing-angle
+    near-mirror reflection. F_spec varies with wavelength via per-λ Fresnel,
+    so the reflection weight should not be flat across lanes."""
+    bsdf_disp = mi.load_dict({
+        'type': 'roughdielectric', 'alpha': 0.05, 'int_ior': 1.5,
+        'abbe': 25.0,
+    })
+    bsdf_no_disp = mi.load_dict({
+        'type': 'roughdielectric', 'alpha': 0.05, 'int_ior': 1.5,
+    })
+
+    si = mi.SurfaceInteraction3f()
+    angle = 70 * dr.pi / 180  # glancing — strong Fresnel angular variation
+    si.wi = [dr.sin(angle), 0, dr.cos(angle)]
+    si.wavelengths = [430.0, 510.0, 590.0, 670.0]
+
+    ctx = mi.BSDFContext()
+    ctx.type_mask = mi.BSDFFlags.GlossyReflection
+
+    _, w_disp    = bsdf_disp.sample(ctx, si, 0.0, [0.5, 0.5])
+    _, w_no_disp = bsdf_no_disp.sample(ctx, si, 0.0, [0.5, 0.5])
+
+    w_no_disp_arr = mi.unpolarized_spectrum(w_no_disp)
+    w_disp_arr    = mi.unpolarized_spectrum(w_disp)
+
+    # No dispersion → flat across lanes.
+    assert dr.allclose(w_no_disp_arr[0], w_no_disp_arr[3])
+
+    # With dispersion, the per-λ Fresnel makes the reflection weight differ.
+    spread = float(dr.max(w_disp_arr) - dr.min(w_disp_arr))
+    assert spread > 1e-4, f'dispersion should vary reflection weight; spread={spread}'
+
+
+def test18_dispersion_transmission_hero_only(variant_scalar_spectral):
+    """With dispersion, transmission sampling should mask non-hero
+    wavelengths to zero (the refraction direction is wavelength-dependent
+    and only the hero wavelength refracts to the sampled direction)."""
+    bsdf = mi.load_dict({
+        'type': 'roughdielectric', 'alpha': 0.05, 'int_ior': 1.5,
+        'abbe': 25.0,
+    })
+
+    si = mi.SurfaceInteraction3f()
+    si.wi = [0.0, 0.0, 1.0]  # straight on
+    si.wavelengths = [430.0, 510.0, 590.0, 670.0]
+
+    ctx = mi.BSDFContext()
+    ctx.type_mask = mi.BSDFFlags.GlossyTransmission
+
+    bs, w = bsdf.sample(ctx, si, 0.0, [0.5, 0.5])
+    assert bs.sampled_type == +mi.BSDFFlags.GlossyTransmission
+
+    w_arr = mi.unpolarized_spectrum(w)
+    # Hero wavelength carries weight; non-hero are zero.
+    assert float(w_arr[0]) > 0.0
+    assert dr.allclose(w_arr[1], 0.0)
+    assert dr.allclose(w_arr[2], 0.0)
+    assert dr.allclose(w_arr[3], 0.0)
