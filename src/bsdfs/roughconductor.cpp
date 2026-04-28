@@ -2,9 +2,11 @@
 #include <mitsuba/core/fwd.h>
 #include <mitsuba/core/plugin.h>
 #include <mitsuba/render/bsdf.h>
+#include <mitsuba/render/fresnel.h>
 #include <mitsuba/render/ior.h>
 #include <mitsuba/render/microfacet.h>
 #include <mitsuba/render/texture.h>
+#include <drjit/complex.h>
 
 NAMESPACE_BEGIN(mitsuba)
 
@@ -55,6 +57,25 @@ Rough conductor material (:monosp:`roughconductor`)
    - Enables a sampling technique proposed by Heitz and D'Eon :cite:`Heitz1014Importance`, which
      focuses computation on the visible parts of the microfacet normal distribution, considerably
      reducing variance in some cases. (Default: |true|, i.e. use visible normal sampling)
+
+ * - film_thickness
+   - |float|
+   - Optional thickness of a non-absorbing dielectric film coating the metal
+     microfacets, in nanometers. When nonzero in a spectral, non-polarized
+     variant, each microfacet's reflectance is given by the Airy formula for
+     an ambient → film → conductor stack — producing iridescent metals such
+     as oil-on-chrome, anodized aluminium, AR-coated mirrors, and the
+     structural color of beetle shells / peacock feathers (which are
+     effectively rough conductive substrates with thin layers). Not yet
+     supported in polarized variants. Ignored in RGB / monochromatic
+     variants. (Default: 0, no film)
+
+ * - film_ior
+   - |float| or |string|
+   - Refractive index of the thin film, specified numerically or via a
+     known material name. Treated as absolute (the conductor BSDF assumes
+     ambient IOR = 1). Only consulted when ``film_thickness > 0``.
+     (Default: air / 1.000277)
 
 This plugin implements a realistic microfacet scattering model for rendering
 rough conducting materials, such as metals.
@@ -152,6 +173,20 @@ consider using the :ref:`twosided <bsdf-twosided>` BRDF adapter.
 In *polarized* rendering modes, the material automatically switches to a polarized
 implementation of the underlying Fresnel equations.
 
+Thin-film interference (spectral variants only)
+***********************************************
+
+Setting ``film_thickness`` (in nanometers) coats each microfacet with a
+single non-absorbing dielectric film of refractive index ``film_ior``.
+The microfacet's reflectance becomes wavelength-dependent via the Airy
+formula evaluated at its local incidence angle, with the conductor's
+complex IOR as the substrate. This is the standard model for iridescent
+metals (oil-on-chrome, anodized aluminium, AR-coated optics) and for
+the structural color of beetle shells / peacock feathers — which are
+effectively rough metallic substrates with thin biological films. See
+:ref:`conductor <bsdf-conductor>` for the full Airy derivation and the
+typical-thickness reference table.
+
  */
 
 template <typename Float, typename Spectrum>
@@ -201,6 +236,29 @@ public:
         if (props.has_property("specular_reflectance"))
             m_specular_reflectance = props.get_texture<Texture>("specular_reflectance", 1.f);
 
+        /* Optional thin-film interference (see SmoothConductor for the
+           full write-up). The film coats each microfacet; reflectance is
+           given by the Airy formula evaluated per wavelength at the
+           microfacet's local incidence angle. The polarized Mueller path
+           does not yet handle thin-film phase shifts; we throw rather
+           than silently produce wrong polarization output. */
+        ScalarFloat film_thickness = props.get<ScalarFloat>("film_thickness", 0.f);
+        ScalarFloat film_ior_abs   = lookup_ior(props, "film_ior", "air");
+
+        if (film_thickness < 0.f)
+            Throw("'film_thickness' must be non-negative (got %f).", film_thickness);
+        if (film_ior_abs <= 0.f)
+            Throw("'film_ior' must be positive (got %f).", film_ior_abs);
+
+        if constexpr (is_polarized_v<Spectrum>) {
+            if (film_thickness > 0.f)
+                Throw("'film_thickness' is not yet supported in polarized "
+                      "variants of roughconductor.");
+        }
+
+        m_film_thickness = film_thickness;
+        m_film_ior       = film_ior_abs;  // ambient n_a = 1, already relative
+
         m_flags = BSDFFlags::GlossyReflection | BSDFFlags::FrontSide;
         if (m_alpha_u != m_alpha_v)
             m_flags = m_flags | BSDFFlags::Anisotropic;
@@ -222,6 +280,81 @@ public:
 
         cb->put("eta", m_eta, ParamFlags::Differentiable | ParamFlags::Discontinuous);
         cb->put("k",   m_k,   ParamFlags::Differentiable | ParamFlags::Discontinuous);
+    }
+
+    bool has_thin_film() const {
+        return is_spectral_v<Spectrum> && !is_polarized_v<Spectrum> &&
+               m_film_thickness > 0.f;
+    }
+
+    /// Per-microfacet thin-film intensity reflectance for a non-absorbing
+    /// dielectric film over a conductor. Bottom (film → conductor) Fresnel
+    /// amplitudes are complex; the Airy combine is done in complex
+    /// arithmetic per polarization. See SmoothConductor for the derivation.
+    UnpolarizedSpectrum thin_film_reflectance(
+            Float cos_h,
+            const dr::Complex<UnpolarizedSpectrum> &eta_substrate,
+            const Wavelength &wavelengths) const {
+        if constexpr (is_spectral_v<Spectrum> && !is_polarized_v<Spectrum>) {
+            using CSpec = dr::Complex<UnpolarizedSpectrum>;
+
+            // Mitsuba's internal Fresnel convention has Im(eta) <= 0; the
+            // BSDF stores k as positive, so conjugate to match.
+            CSpec eta = dr::conj(eta_substrate);
+
+            Float cos_a = dr::abs(cos_h);
+            Float sin2_a = 1.f - dr::square(cos_a);
+
+            // Snell into the (real) film.
+            ScalarFloat inv_nf_sq = 1.f / (m_film_ior * m_film_ior);
+            Float sin2_f = sin2_a * inv_nf_sq;
+            Float cos_f  = dr::safe_sqrt(1.f - sin2_f);
+
+            // Snell into the (complex) conductor.
+            CSpec sin2_c = CSpec(UnpolarizedSpectrum(sin2_a),
+                                 UnpolarizedSpectrum(0.f)) / (eta * eta);
+            CSpec cos_c = dr::sqrt(CSpec(UnpolarizedSpectrum(1.f),
+                                         UnpolarizedSpectrum(0.f)) - sin2_c);
+
+            // Top interface (ambient → film), real amplitudes.
+            Float r01_s = (cos_a - m_film_ior * cos_f) /
+                          (cos_a + m_film_ior * cos_f);
+            Float r01_p = (m_film_ior * cos_a - cos_f) /
+                          (m_film_ior * cos_a + cos_f);
+
+            // Bottom interface (film → conductor), complex amplitudes.
+            UnpolarizedSpectrum nf_cf(m_film_ior * cos_f);
+            CSpec eta_cos_c = eta * cos_c;
+            CSpec eta_cos_f = eta * UnpolarizedSpectrum(cos_f);
+            CSpec nf_cos_c  = cos_c * m_film_ior;
+
+            CSpec r12_s = (CSpec(nf_cf, UnpolarizedSpectrum(0.f)) - eta_cos_c) /
+                          (CSpec(nf_cf, UnpolarizedSpectrum(0.f)) + eta_cos_c);
+            CSpec r12_p = (eta_cos_f - nf_cos_c) /
+                          (eta_cos_f + nf_cos_c);
+
+            UnpolarizedSpectrum phi =
+                (4.f * dr::Pi<ScalarFloat>) * m_film_ior * m_film_thickness *
+                cos_f * dr::rcp(wavelengths);
+            CSpec e_iphi(dr::cos(phi), dr::sin(phi));
+
+            auto airy = [&](Float r01, const CSpec &r12) {
+                CSpec r12_e = r12 * e_iphi;
+                CSpec num   = CSpec(UnpolarizedSpectrum(r01),
+                                    UnpolarizedSpectrum(0.f)) + r12_e;
+                CSpec denom = CSpec(UnpolarizedSpectrum(1.f),
+                                    UnpolarizedSpectrum(0.f)) +
+                              r12_e * r01;
+                return dr::squared_norm(num / denom);
+            };
+
+            return 0.5f * (airy(r01_s, r12_s) + airy(r01_p, r12_p));
+        } else {
+            DRJIT_MARK_USED(cos_h);
+            DRJIT_MARK_USED(eta_substrate);
+            DRJIT_MARK_USED(wavelengths);
+            return UnpolarizedSpectrum(0.f);
+        }
     }
 
     std::pair<BSDFSample3f, Spectrum> sample(const BSDFContext &ctx,
@@ -302,7 +435,10 @@ public:
                                               -wo_hat, s_axis_in, mueller::stokes_basis(-wo_hat),
                                                wi_hat, s_axis_out, mueller::stokes_basis(wi_hat));
         } else {
-            F = fresnel_conductor(UnpolarizedSpectrum(dr::dot(si.wi, m)), eta_c);
+            if (has_thin_film())
+                F = thin_film_reflectance(dr::dot(si.wi, m), eta_c, si.wavelengths);
+            else
+                F = fresnel_conductor(UnpolarizedSpectrum(dr::dot(si.wi, m)), eta_c);
         }
 
         /* If requested, include the specular reflectance component */
@@ -379,7 +515,10 @@ public:
                                               -wo_hat, s_axis_in, mueller::stokes_basis(-wo_hat),
                                                wi_hat, s_axis_out, mueller::stokes_basis(wi_hat));
         } else {
-            F = fresnel_conductor(UnpolarizedSpectrum(dr::dot(si.wi, H)), eta_c);
+            if (has_thin_film())
+                F = thin_film_reflectance(dr::dot(si.wi, H), eta_c, si.wavelengths);
+            else
+                F = fresnel_conductor(UnpolarizedSpectrum(dr::dot(si.wi, H)), eta_c);
         }
 
         /* If requested, include the specular reflectance component */
@@ -501,7 +640,10 @@ public:
                                               -wo_hat, s_axis_in, mueller::stokes_basis(-wo_hat),
                                                wi_hat, s_axis_out, mueller::stokes_basis(wi_hat));
         } else {
-            F = fresnel_conductor(UnpolarizedSpectrum(dr::dot(si.wi, H)), eta_c);
+            if (has_thin_film())
+                F = thin_film_reflectance(dr::dot(si.wi, H), eta_c, si.wavelengths);
+            else
+                F = fresnel_conductor(UnpolarizedSpectrum(dr::dot(si.wi, H)), eta_c);
         }
 
         // If requested, include the specular reflectance component
@@ -527,8 +669,12 @@ public:
         if (m_specular_reflectance)
            oss << "  specular_reflectance = " << string::indent(m_specular_reflectance) << "," << std::endl;
         oss << "  eta = " << string::indent(m_eta) << "," << std::endl
-            << "  k = " << string::indent(m_k) << std::endl
-            << "]";
+            << "  k = " << string::indent(m_k);
+        if (m_film_thickness > 0.f)
+            oss << "," << std::endl
+                << "  film_thickness = " << m_film_thickness << " nm," << std::endl
+                << "  film_ior = "       << m_film_ior;
+        oss << std::endl << "]";
         return oss.str();
     }
 
@@ -546,9 +692,12 @@ private:
     ref<Texture> m_k;
     /// Specular reflectance component
     ref<Texture> m_specular_reflectance;
+    /// Thin-film thickness (nm) and IOR
+    ScalarFloat m_film_thickness;
+    ScalarFloat m_film_ior;
 
     MI_TRAVERSE_CB(Base, m_alpha_u, m_alpha_v, m_eta, m_k,
-                   m_specular_reflectance)
+                   m_specular_reflectance, m_film_thickness, m_film_ior)
 };
 
 MI_EXPORT_PLUGIN(RoughConductor)
