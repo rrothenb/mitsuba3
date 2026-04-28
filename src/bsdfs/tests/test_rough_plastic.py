@@ -75,3 +75,90 @@ def test04_eval_attribute(variants_all_rgb):
     assert dr.allclose(bsdf.eval_attribute('diffuse_reflectance', si), reflectance)
     assert dr.allclose(bsdf.eval_attribute_3('diffuse_reflectance', si), reflectance)
     assert dr.allclose(bsdf.eval_attribute_1('alpha', si), roughness)
+
+
+def test_thin_film_construct(variant_scalar_rgb):
+    # Film + dispersion params accepted in non-spectral variants but inert.
+    b = mi.load_dict({'type': 'roughplastic', 'alpha': 0.05,
+                      'film_thickness': 300.0, 'film_ior': 1.38})
+    assert b is not None
+
+    b = mi.load_dict({'type': 'roughplastic', 'alpha': 0.05, 'abbe': 30.0})
+    assert b is not None
+
+    # Negative thickness rejected.
+    with pytest.raises(RuntimeError):
+        mi.load_dict({'type': 'roughplastic', 'film_thickness': -10.0})
+
+    # Mutual exclusion of dispersion params.
+    with pytest.raises(RuntimeError):
+        mi.load_dict({'type': 'roughplastic', 'abbe': 30.0,
+                      'cauchy_b': 0.005})
+
+    # Negative abbe rejected.
+    with pytest.raises(RuntimeError):
+        mi.load_dict({'type': 'roughplastic', 'abbe': -10.0})
+
+
+def test_thin_film_spectral(variant_scalar_spectral):
+    """In a spectral variant, an enabled thin film should give a
+    wavelength-dependent specular highlight on the rough plastic surface."""
+    bsdf_film = mi.load_dict({
+        'type': 'roughplastic', 'alpha': 0.05, 'int_ior': 1.5,
+        'film_thickness': 400.0, 'film_ior': 2.4,
+        'diffuse_reflectance': 0.5,
+    })
+    bsdf_no_film = mi.load_dict({
+        'type': 'roughplastic', 'alpha': 0.05, 'int_ior': 1.5,
+        'diffuse_reflectance': 0.5,
+    })
+
+    si = mi.SurfaceInteraction3f()
+    angle = 30 * dr.pi / 180
+    si.wi = [dr.sin(angle), 0, dr.cos(angle)]
+    si.wavelengths = [430.0, 510.0, 590.0, 670.0]
+
+    # Evaluate at a near-mirror direction to probe the per-microfacet
+    # specular Fresnel.
+    wo = [-dr.sin(angle), 0, dr.cos(angle)]
+    ctx = mi.BSDFContext()
+
+    val_film    = mi.unpolarized_spectrum(bsdf_film.eval(ctx, si, wo))
+    val_no_film = mi.unpolarized_spectrum(bsdf_no_film.eval(ctx, si, wo))
+
+    # No film: flat across lanes.
+    assert dr.allclose(val_no_film[0], val_no_film[3])
+
+    # Film: per-wavelength variation visible.
+    spread = float(dr.max(val_film) - dr.min(val_film))
+    assert spread > 1e-3, f'film should vary highlight by λ; spread={spread}'
+
+
+def test_dispersion_spectral(variant_scalar_spectral):
+    """Dispersion alone (no film) should also vary the highlight."""
+    bsdf_disp = mi.load_dict({
+        'type': 'roughplastic', 'alpha': 0.05, 'int_ior': 1.5,
+        'abbe': 25.0, 'diffuse_reflectance': 0.5,
+    })
+    bsdf_no_disp = mi.load_dict({
+        'type': 'roughplastic', 'alpha': 0.05, 'int_ior': 1.5,
+        'diffuse_reflectance': 0.5,
+    })
+
+    si = mi.SurfaceInteraction3f()
+    angle = 70 * dr.pi / 180  # glancing — strong Fresnel angular variation
+    si.wi = [dr.sin(angle), 0, dr.cos(angle)]
+    si.wavelengths = [430.0, 510.0, 590.0, 670.0]
+    wo = [-dr.sin(angle), 0, dr.cos(angle)]
+
+    ctx = mi.BSDFContext()
+
+    val_disp    = mi.unpolarized_spectrum(bsdf_disp.eval(ctx, si, wo))
+    val_no_disp = mi.unpolarized_spectrum(bsdf_no_disp.eval(ctx, si, wo))
+
+    # No dispersion → flat across lanes.
+    assert dr.allclose(val_no_disp[0], val_no_disp[3])
+
+    # With dispersion, per-λ Fresnel makes the value differ across lanes.
+    spread = float(dr.max(val_disp) - dr.min(val_disp))
+    assert spread > 1e-5, f'dispersion should vary highlight; spread={spread}'

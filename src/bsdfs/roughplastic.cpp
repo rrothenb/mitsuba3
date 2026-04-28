@@ -21,7 +21,7 @@ Rough plastic material (:monosp:`roughplastic`)
 -----------------------------------------------
 
 .. pluginparameters::
- :extra-rows: 8
+ :extra-rows: 12
 
  * - diffuse_reflectance
    - |spectrum| or |texture|
@@ -76,6 +76,37 @@ Rough plastic material (:monosp:`roughplastic`)
    - |float|
    - Relative index of refraction from the exterior to the interior
    - |exposed|, |differentiable|, |discontinuous|
+
+ * - abbe
+   - |float|
+   - Optional Abbe number :math:`V` of the dielectric layer (dimensionless).
+     Enables Cauchy dispersion of the substrate IOR. The specular highlight
+     gains a chromatic shift across wavelengths. Mutually exclusive with
+     ``cauchy_b``. Ignored in RGB / monochromatic variants. See
+     :ref:`dielectric <bsdf-dielectric>` for the formula and
+     typical-value table. (Default: 0, no dispersion)
+
+ * - cauchy_b
+   - |float|
+   - Cauchy dispersion coefficient :math:`B` (in :math:`\mu m^2`).
+     Mutually exclusive with ``abbe``. Ignored in RGB / monochromatic
+     variants. (Default: 0, no dispersion)
+
+ * - film_thickness
+   - |float|
+   - Optional thickness of a non-absorbing dielectric film coating the
+     microfacets, in nanometers. When nonzero in a spectral variant, each
+     microfacet's reflectance is given by the Airy formula — producing
+     iridescence on rough plastic-like surfaces (varnished rough wood,
+     painted rough metal, weathered acrylic). Composes with ``abbe`` /
+     ``cauchy_b``. Ignored in RGB / monochromatic variants.
+     (Default: 0, no film)
+
+ * - film_ior
+   - |float| or |string|
+   - Refractive index of the thin film, specified numerically or via a
+     known material name. Stored relative to ``ext_ior``. Only consulted
+     when ``film_thickness > 0``. (Default: air / 1.000277)
 
 This plugin implements a realistic microfacet scattering model for rendering
 rough dielectric materials with internal scattering, such as plastic.
@@ -160,6 +191,22 @@ the :monosp:`nonlinear` parameter:
 For more details, please refer to the description
 of this parameter given in the :ref:`plastic <bsdf-plastic>` plugin section.
 
+Dispersion and thin-film interference (spectral variants only)
+**************************************************************
+
+``abbe`` / ``cauchy_b`` and ``film_thickness`` / ``film_ior`` work the
+same way as in :ref:`plastic <bsdf-plastic>` and
+:ref:`roughdielectric <bsdf-roughdielectric>` — see those plugins for
+the full discussion. The microfacet-level Fresnel reflectance becomes
+wavelength-dependent (per-microfacet Airy formula and/or per-wavelength
+Fresnel from Cauchy IOR), which gives iridescence and chromatic tint on
+the highlight. **Caveat**: the diffuse contribution is gated by
+precomputed scalar transmittance tables (``m_external_transmittance`` /
+``m_internal_reflectance``) that use the bare ``m_eta`` only — they are
+not currently re-derived per-wavelength when thin-film or dispersion is
+enabled. The dominant visual effect (highlight iridescence) is correct;
+the diffuse coupling carries a small approximation.
+
  */
 
 template <typename Float, typename Spectrum>
@@ -180,6 +227,46 @@ public:
                   "refraction must be positive and differ!");
 
         m_eta = int_ior / ext_ior;
+
+        /* Optional thin-film interference (see SmoothPlastic for the full
+           write-up). Coats each microfacet; per-microfacet reflectance is
+           given by the Airy formula evaluated at the local incidence angle.
+           NOTE: only the specular highlight picks up iridescence — the
+           diffuse coupling uses precomputed scalar transmittance tables
+           (m_external_transmittance / m_internal_reflectance) that are
+           computed against the bare m_eta and are not currently re-derived
+           per-wavelength when thin-film or dispersion is enabled. The
+           specular highlight is the dominant effect; the diffuse coupling
+           inaccuracy is small. */
+        ScalarFloat film_thickness = props.get<ScalarFloat>("film_thickness", 0.f);
+        ScalarFloat film_ior_abs   = lookup_ior(props, "film_ior", "air");
+
+        if (film_thickness < 0.f)
+            Throw("'film_thickness' must be non-negative (got %f).", film_thickness);
+        if (film_ior_abs <= 0.f)
+            Throw("'film_ior' must be positive (got %f).", film_ior_abs);
+
+        m_film_thickness = film_thickness;
+        m_film_ior       = film_ior_abs / ext_ior;
+
+        /* Optional Cauchy / Abbe dispersion of the dielectric layer. Same
+           parameterization as in SmoothDielectric. Like thin-film, only
+           affects the specular path (per-microfacet F); diffuse coupling
+           uses the scalar precomputation. */
+        ScalarFloat cauchy_b = props.get<ScalarFloat>("cauchy_b", 0.f);
+        ScalarFloat abbe     = props.get<ScalarFloat>("abbe", 0.f);
+
+        if (cauchy_b != 0.f && abbe != 0.f)
+            Throw("Specify either 'cauchy_b' or 'abbe', not both.");
+        if (abbe < 0.f)
+            Throw("'abbe' must be positive (got %f).", abbe);
+
+        if (abbe != 0.f) {
+            ScalarFloat eta_scalar = int_ior / ext_ior;
+            cauchy_b = (eta_scalar - 1.f) / (1.9085f * abbe);
+        }
+
+        m_cauchy_b = cauchy_b;
 
         m_diffuse_reflectance  = props.get_texture<Texture>("diffuse_reflectance",  .5f);
 
@@ -252,6 +339,85 @@ public:
         }
         dr::make_opaque(m_eta, m_inv_eta_2, m_alpha, m_specular_sampling_weight,
                         m_internal_reflectance);
+    }
+
+    bool has_thin_film() const {
+        return is_spectral_v<Spectrum> && m_film_thickness > 0.f;
+    }
+
+    bool has_dispersion() const {
+        return is_spectral_v<Spectrum> && m_cauchy_b != 0.f;
+    }
+
+    /// Per-wavelength relative IOR via Cauchy's two-term formula.
+    /// See SmoothDielectric::eval_eta for the derivation.
+    UnpolarizedSpectrum eval_eta(const Wavelength &wavelengths) const {
+        if constexpr (is_spectral_v<Spectrum>) {
+            if (m_cauchy_b != 0.f) {
+                UnpolarizedSpectrum lambda_um = wavelengths * ScalarFloat(1e-3f);
+                UnpolarizedSpectrum inv_lambda_sq = dr::rcp(dr::square(lambda_um));
+                ScalarFloat lambda_ref = 0.5893f;
+                ScalarFloat inv_ref_sq = 1.f / (lambda_ref * lambda_ref);
+                return m_eta + m_cauchy_b * (inv_lambda_sq - inv_ref_sq);
+            }
+            DRJIT_MARK_USED(wavelengths);
+            return UnpolarizedSpectrum(m_eta);
+        } else {
+            DRJIT_MARK_USED(wavelengths);
+            return UnpolarizedSpectrum(m_eta);
+        }
+    }
+
+    /// Per-microfacet thin-film reflectance via the Airy formula. The
+    /// substrate IOR is per-wavelength (composes with dispersion).
+    UnpolarizedSpectrum thin_film_reflectance(
+            Float cos_h,
+            const UnpolarizedSpectrum &eta_substrate,
+            const Wavelength &wavelengths) const {
+        if constexpr (is_spectral_v<Spectrum>) {
+            Float cos_a = dr::abs(cos_h);
+            Float sin2_a = 1.f - dr::square(cos_a);
+
+            ScalarFloat inv_nf_sq = 1.f / (m_film_ior * m_film_ior);
+            Float sin2_f = sin2_a * inv_nf_sq;
+            Float cos_f  = dr::safe_sqrt(1.f - sin2_f);
+
+            UnpolarizedSpectrum inv_ns_sq = dr::rcp(dr::square(eta_substrate));
+            UnpolarizedSpectrum sin2_s = sin2_a * inv_ns_sq;
+            auto tir = sin2_s >= 1.f;
+            sin2_s = dr::minimum(sin2_s, UnpolarizedSpectrum(1.f - 1e-7f));
+            UnpolarizedSpectrum cos_s = dr::safe_sqrt(1.f - sin2_s);
+
+            Float r01_s = (cos_a - m_film_ior * cos_f) /
+                          (cos_a + m_film_ior * cos_f);
+            Float r01_p = (m_film_ior * cos_a - cos_f) /
+                          (m_film_ior * cos_a + cos_f);
+            UnpolarizedSpectrum r12_s = (m_film_ior * cos_f - eta_substrate * cos_s) /
+                                        (m_film_ior * cos_f + eta_substrate * cos_s);
+            UnpolarizedSpectrum r12_p = (eta_substrate * cos_f - m_film_ior * cos_s) /
+                                        (eta_substrate * cos_f + m_film_ior * cos_s);
+
+            UnpolarizedSpectrum phi =
+                (4.f * dr::Pi<ScalarFloat>) * m_film_ior * m_film_thickness *
+                cos_f * dr::rcp(wavelengths);
+            UnpolarizedSpectrum cos_phi = dr::cos(phi);
+
+            auto airy = [&](Float r01, const UnpolarizedSpectrum &r12) {
+                UnpolarizedSpectrum r01_sq(r01 * r01);
+                UnpolarizedSpectrum r12_sq = dr::square(r12);
+                UnpolarizedSpectrum two_r = 2.f * r01 * r12 * cos_phi;
+                return (r01_sq + r12_sq + two_r) /
+                       (1.f + r01_sq * r12_sq + two_r);
+            };
+
+            UnpolarizedSpectrum R = 0.5f * (airy(r01_s, r12_s) + airy(r01_p, r12_p));
+            return dr::select(tir, UnpolarizedSpectrum(1.f), R);
+        } else {
+            DRJIT_MARK_USED(cos_h);
+            DRJIT_MARK_USED(eta_substrate);
+            DRJIT_MARK_USED(wavelengths);
+            return UnpolarizedSpectrum(0.f);
+        }
     }
 
     std::pair<BSDFSample3f, Spectrum> sample(const BSDFContext &ctx,
@@ -337,14 +503,25 @@ public:
             // Evaluate the microfacet normal distribution
             Float D = distr.eval(H);
 
-            // Fresnel term
-            Float F = std::get<0>(fresnel(dr::dot(si.wi, H), Float(m_eta)));
+            // Fresnel term — per wavelength when dispersion or thin-film is on
+            UnpolarizedSpectrum eta_spec = eval_eta(si.wavelengths);
+            Float eta_hero = has_dispersion() ? Float(eta_spec[0]) : Float(m_eta);
+            Float F = std::get<0>(fresnel(dr::dot(si.wi, H), eta_hero));
+            UnpolarizedSpectrum F_spec(F);
+            if (has_dispersion()) {
+                auto [F_s, ct_s, eit_s, eti_s] =
+                    fresnel(UnpolarizedSpectrum(dr::dot(si.wi, H)), eta_spec);
+                (void) ct_s; (void) eit_s; (void) eti_s;
+                F_spec = F_s;
+            }
+            if (has_thin_film())
+                F_spec = thin_film_reflectance(dr::dot(si.wi, H), eta_spec, si.wavelengths);
 
             // Smith's shadow-masking function
             Float G = distr.G(si.wi, wo, H);
 
             // Calculate the specular reflection component
-            value = F * D * G / (4.f * cos_theta_i);
+            value = F_spec * D * G / (4.f * cos_theta_i);
 
             if (m_specular_reflectance)
                 value *= m_specular_reflectance->eval(si, active);
@@ -474,14 +651,25 @@ public:
 
         UnpolarizedSpectrum value(0.f);
         if (has_specular) {
-            // Fresnel term
-            Float F = std::get<0>(fresnel(dr::dot(si.wi, H), Float(m_eta)));
+            // Fresnel term — per wavelength when dispersion or thin-film is on
+            UnpolarizedSpectrum eta_spec = eval_eta(si.wavelengths);
+            Float eta_hero = has_dispersion() ? Float(eta_spec[0]) : Float(m_eta);
+            Float F = std::get<0>(fresnel(dr::dot(si.wi, H), eta_hero));
+            UnpolarizedSpectrum F_spec(F);
+            if (has_dispersion()) {
+                auto [F_s, ct_s, eit_s, eti_s] =
+                    fresnel(UnpolarizedSpectrum(dr::dot(si.wi, H)), eta_spec);
+                (void) ct_s; (void) eit_s; (void) eti_s;
+                F_spec = F_s;
+            }
+            if (has_thin_film())
+                F_spec = thin_film_reflectance(dr::dot(si.wi, H), eta_spec, si.wavelengths);
 
             // Smith's shadow-masking function
             Float G = distr.smith_g1(wo, H) * smith_g1_wi;
 
             // Calculate the specular reflection component
-            value = F * D * G / (4.f * cos_theta_i);
+            value = F_spec * D * G / (4.f * cos_theta_i);
 
             if (m_specular_reflectance)
                 value *= m_specular_reflectance->eval(si, active);
@@ -519,8 +707,15 @@ public:
 
         oss << "  specular_sampling_weight = " << m_specular_sampling_weight          << "," << std::endl
             << "  eta = "                      << m_eta                               << "," << std::endl
-            << "  nonlinear = "                << m_nonlinear                         << std::endl
-            << "]";
+            << "  nonlinear = "                << m_nonlinear;
+        if (m_cauchy_b != 0.f)
+            oss << "," << std::endl
+                << "  cauchy_b = " << m_cauchy_b;
+        if (m_film_thickness > 0.f)
+            oss << "," << std::endl
+                << "  film_thickness = " << m_film_thickness << " nm," << std::endl
+                << "  film_ior = "       << m_film_ior;
+        oss << std::endl << "]";
         return oss.str();
     }
 
@@ -537,10 +732,14 @@ private:
     bool m_sample_visible;
     DynamicBuffer<Float> m_external_transmittance;
     Float m_internal_reflectance;
+    ScalarFloat m_cauchy_b;
+    ScalarFloat m_film_thickness;
+    ScalarFloat m_film_ior;
 
     MI_TRAVERSE_CB(Base, m_diffuse_reflectance, m_specular_reflectance, m_eta,
                    m_inv_eta_2, m_alpha, m_specular_sampling_weight,
-                   m_external_transmittance, m_internal_reflectance)
+                   m_external_transmittance, m_internal_reflectance,
+                   m_cauchy_b, m_film_thickness, m_film_ior)
 };
 
 MI_EXPORT_PLUGIN(RoughPlastic)
