@@ -19,7 +19,7 @@ Rough dielectric material (:monosp:`roughdielectric`)
 -----------------------------------------------------
 
 .. pluginparameters::
- :extra-rows: 6
+ :extra-rows: 8
 
  * - int_ior
    - |float| or |string|
@@ -64,6 +64,23 @@ Rough dielectric material (:monosp:`roughdielectric`)
    - |float|
    - Relative index of refraction from the exterior to the interior
    - |exposed|, |differentiable|, |discontinuous|
+
+ * - film_thickness
+   - |float|
+   - Optional thickness of a non-absorbing dielectric film coating the
+     microfacets, in nanometers. When nonzero in a spectral, non-polarized
+     variant, each microfacet's reflectance is given by the Airy formula —
+     producing iridescence on rough surfaces (frosted glass with an oil
+     coating, weathered glass, etched optics with AR coatings). Substrate
+     IOR is constant across wavelengths here (no dispersion), so refraction
+     direction is unaffected. Not yet supported in polarized variants.
+     Ignored in RGB / monochromatic variants. (Default: 0, no film)
+
+ * - film_ior
+   - |float| or |string|
+   - Refractive index of the thin film, specified numerically or via a
+     known material name. Stored relative to ``ext_ior``. Only consulted
+     when ``film_thickness > 0``. (Default: air / 1.000277)
 
 This plugin implements a realistic microfacet scattering model for rendering
 rough interfaces between dielectric materials, such as a transition from air to
@@ -154,6 +171,20 @@ approach of sampling all normals is still available and can be enabled
 by setting :monosp:`sample_visible` to |false|. However this will lead
 to significantly slower convergence.
 
+Thin-film interference (spectral variants only)
+***********************************************
+
+Setting ``film_thickness`` (in nanometers) coats each microfacet with a
+single non-absorbing dielectric film of refractive index ``film_ior``. The
+microfacet's reflectance becomes wavelength-dependent via the Airy formula
+evaluated at the local incidence angle on that microfacet, producing
+iridescence even on rough surfaces. See :ref:`dielectric <bsdf-dielectric>`
+for the full derivation and typical-thickness reference table. Refraction
+direction is determined by the substrate IOR alone (the film is too thin
+to displace the refracted ray), and since the substrate IOR is constant
+across wavelengths here, all wavelengths refract the same way — no
+hero-wavelength masking is needed on transmission.
+
  */
 
 template <typename Float, typename Spectrum>
@@ -181,6 +212,30 @@ public:
 
         m_eta = int_ior / ext_ior;
         m_inv_eta = ext_ior / int_ior;
+
+        /* Optional thin-film interference. See SmoothDielectric for the full
+           write-up. The film coats each microfacet; reflectance is given by
+           the Airy formula evaluated at the microfacet's local incidence
+           angle (dot(wi, m)). The substrate IOR for roughdielectric is a
+           constant scalar (no dispersion here yet), so refraction direction
+           is wavelength-independent — no hero-wavelength masking needed on
+           transmission, only the per-wavelength reflectance varies. */
+        ScalarFloat film_thickness = props.get<ScalarFloat>("film_thickness", 0.f);
+        ScalarFloat film_ior_abs   = lookup_ior(props, "film_ior", "air");
+
+        if (film_thickness < 0.f)
+            Throw("'film_thickness' must be non-negative (got %f).", film_thickness);
+        if (film_ior_abs <= 0.f)
+            Throw("'film_ior' must be positive (got %f).", film_ior_abs);
+
+        if constexpr (is_polarized_v<Spectrum>) {
+            if (film_thickness > 0.f)
+                Throw("'film_thickness' is not yet supported in polarized "
+                      "variants of roughdielectric.");
+        }
+
+        m_film_thickness = film_thickness;
+        m_film_ior       = film_ior_abs / ext_ior;
 
         if (props.has_property("distribution")) {
             std::string distr = string::to_lower(props.get<std::string_view>("distribution"));
@@ -239,6 +294,66 @@ public:
         dr::make_opaque(m_eta, m_inv_eta);
     }
 
+    bool has_thin_film() const {
+        return is_spectral_v<Spectrum> && !is_polarized_v<Spectrum> &&
+               m_film_thickness > 0.f;
+    }
+
+    /// Per-microfacet thin-film intensity reflectance via the Airy formula.
+    /// Substrate IOR is the (scalar) m_eta promoted into the spectrum, since
+    /// roughdielectric does not yet support dispersion.
+    UnpolarizedSpectrum thin_film_reflectance(
+            Float cos_h, const Wavelength &wavelengths) const {
+        if constexpr (is_spectral_v<Spectrum> && !is_polarized_v<Spectrum>) {
+            Float cos_a = dr::abs(cos_h);
+            Float sin2_a = 1.f - dr::square(cos_a);
+
+            // Snell into the film (real).
+            ScalarFloat inv_nf_sq = 1.f / (m_film_ior * m_film_ior);
+            Float sin2_f = sin2_a * inv_nf_sq;
+            Float cos_f  = dr::safe_sqrt(1.f - sin2_f);
+
+            // Snell into substrate (real, scalar IOR — m_eta is Float here
+            // but constant across wavelengths since no dispersion).
+            Float inv_ns_sq = dr::rcp(dr::square(m_eta));
+            Float sin2_s = sin2_a * inv_ns_sq;
+            auto tir = sin2_s >= 1.f;
+            sin2_s = dr::minimum(sin2_s, Float(1.f - 1e-7f));
+            Float cos_s = dr::safe_sqrt(1.f - sin2_s);
+
+            // Top interface (ambient → film): n_a = 1.
+            Float r01_s = (cos_a - m_film_ior * cos_f) /
+                          (cos_a + m_film_ior * cos_f);
+            Float r01_p = (m_film_ior * cos_a - cos_f) /
+                          (m_film_ior * cos_a + cos_f);
+            // Bottom (film → substrate): real.
+            Float r12_s = (m_film_ior * cos_f - m_eta * cos_s) /
+                          (m_film_ior * cos_f + m_eta * cos_s);
+            Float r12_p = (m_eta * cos_f - m_film_ior * cos_s) /
+                          (m_eta * cos_f + m_film_ior * cos_s);
+
+            UnpolarizedSpectrum phi =
+                (4.f * dr::Pi<ScalarFloat>) * m_film_ior * m_film_thickness *
+                cos_f * dr::rcp(wavelengths);
+            UnpolarizedSpectrum cos_phi = dr::cos(phi);
+
+            auto airy = [&](Float r01, Float r12) {
+                Float r01_sq = r01 * r01;
+                Float r12_sq = r12 * r12;
+                UnpolarizedSpectrum two_r = 2.f * r01 * r12 * cos_phi;
+                return (r01_sq + r12_sq + two_r) /
+                       (1.f + r01_sq * r12_sq + two_r);
+            };
+
+            UnpolarizedSpectrum R = 0.5f * (airy(r01_s, r12_s) + airy(r01_p, r12_p));
+            return dr::select(tir, UnpolarizedSpectrum(1.f), R);
+        } else {
+            DRJIT_MARK_USED(cos_h);
+            DRJIT_MARK_USED(wavelengths);
+            return UnpolarizedSpectrum(0.f);
+        }
+    }
+
     std::pair<BSDFSample3f, Spectrum> sample(const BSDFContext &ctx,
                                              const SurfaceInteraction3f &si,
                                              Float sample1,
@@ -279,6 +394,16 @@ public:
         auto [F, cos_theta_t, eta_it, eta_ti] =
             fresnel(dr::dot(si.wi, m), m_eta);
 
+        /* With thin-film, replace the scalar Fresnel reflectance with the
+           Airy formula evaluated per wavelength at the microfacet's local
+           incidence angle. The hero (lane 0) drives the lobe selection and
+           PDF; the per-wavelength F_spec drives the weight. */
+        UnpolarizedSpectrum F_spec(F);
+        if (has_thin_film()) {
+            F_spec = thin_film_reflectance(dr::dot(si.wi, m), si.wavelengths);
+            F = F_spec[0];
+        }
+
         // Select the lobe to be sampled
         UnpolarizedSpectrum weight;
         Mask selected_r, selected_t;
@@ -294,11 +419,24 @@ public:
                     weight = dr::select(selected_r, r_diff, t_diff);
                 }
             }
+            if (has_thin_film()) {
+                /* Hero λ drove the lobe choice with probability F_hero; reweight
+                   each wavelength by F_λ / F_hero (or (1-F_λ)/(1-F_hero) for
+                   transmission). Substrate IOR is constant across wavelengths,
+                   so all wavelengths refract into the same direction — no need
+                   to mask non-hero lanes on transmission. */
+                UnpolarizedSpectrum w_r = F_spec / dr::detach(F);
+                UnpolarizedSpectrum w_t = (1.f - F_spec) / dr::detach(1.f - F);
+                weight = dr::select(selected_r, w_r, w_t);
+            }
             bs.pdf *= dr::detach(dr::select(selected_r, F, 1.f - F));
         } else {
             if (has_reflection || has_transmission) {
                 selected_r = Mask(has_reflection) && active;
-                weight = has_reflection ? F : (1.f - F);
+                if (has_thin_film())
+                    weight = has_reflection ? F_spec : (UnpolarizedSpectrum(1.f) - F_spec);
+                else
+                    weight = has_reflection ? UnpolarizedSpectrum(F) : UnpolarizedSpectrum(1.f - F);
             } else {
                 return { bs, 0.f };
             }
@@ -393,8 +531,11 @@ public:
         // Evaluate the microfacet normal distribution
         Float D = distr.eval(m);
 
-        // Fresnel factor
+        // Fresnel factor (per wavelength when thin-film is on)
         Float F = std::get<0>(fresnel(dr::dot(si.wi, m), m_eta));
+        UnpolarizedSpectrum F_spec(F);
+        if (has_thin_film())
+            F_spec = thin_film_reflectance(dr::dot(si.wi, m), si.wavelengths);
 
         // Smith's shadow-masking function
         Float G = distr.G(si.wi, wo, m);
@@ -405,7 +546,7 @@ public:
              eval_t = Mask(has_transmission) && !reflect && active;
 
         if (dr::any_or<true>(eval_r)) {
-            UnpolarizedSpectrum value = F * D * G / (4.f * dr::abs(cos_theta_i));
+            UnpolarizedSpectrum value = F_spec * D * G / (4.f * dr::abs(cos_theta_i));
 
             if (m_specular_reflectance)
                 value *= m_specular_reflectance->eval(si, eval_r);
@@ -421,7 +562,7 @@ public:
 
             // Compute the total amount of transmission
             UnpolarizedSpectrum value = dr::abs(
-                (scale * (1.f - F) * D * G * eta * eta * dr::dot(si.wi, m) * dr::dot(wo, m)) /
+                (scale * (1.f - F_spec) * D * G * eta * eta * dr::dot(si.wi, m) * dr::dot(wo, m)) /
                 (cos_theta_i * dr::square(dr::dot(si.wi, m) + eta * dr::dot(wo, m))));
 
             if (m_specular_transmittance)
@@ -492,6 +633,10 @@ public:
 
         if (likely(has_transmission && has_reflection)) {
             Float F = std::get<0>(fresnel(dr::dot(si.wi, m), m_eta));
+            // With thin-film, hero λ governs the sampling probability
+            // (matches what sample() uses).
+            if (has_thin_film())
+                F = Float(thin_film_reflectance(dr::dot(si.wi, m), si.wavelengths)[0]);
             prob *= dr::select(reflect, F, 1.f - F);
         }
 
@@ -549,8 +694,13 @@ public:
         // Evaluate the microfacet normal distribution
         Float D = distr.eval(m);
 
-        // Fresnel factor
+        // Fresnel factor (per wavelength when thin-film is on)
         Float F = std::get<0>(fresnel(dot_wi_m, m_eta));
+        UnpolarizedSpectrum F_spec(F);
+        if (has_thin_film()) {
+            F_spec = thin_film_reflectance(dot_wi_m, si.wavelengths);
+            F = F_spec[0];  // hero drives sampling probability
+        }
 
         // Smith's shadow-masking function
         Float G = distr.G(si.wi, wo, m);
@@ -561,7 +711,7 @@ public:
              eval_t = Mask(has_transmission) && !reflect && active;
 
         if (dr::any_or<true>(eval_r)) {
-            UnpolarizedSpectrum value = F * D * G / (4.f * dr::abs(cos_theta_i));
+            UnpolarizedSpectrum value = F_spec * D * G / (4.f * dr::abs(cos_theta_i));
 
             if (m_specular_reflectance)
                 value *= m_specular_reflectance->eval(si, eval_r);
@@ -577,7 +727,7 @@ public:
 
             // Compute the total amount of transmission
             UnpolarizedSpectrum value = dr::abs(
-                (scale * (1.f - F) * D * G * eta * eta * dot_wi_m * dot_wo_m) /
+                (scale * (1.f - F_spec) * D * G * eta * eta * dot_wi_m * dot_wo_m) /
                 (cos_theta_i * dr::square(dot_wi_m + eta * dot_wo_m)));
 
             if (m_specular_transmittance)
@@ -626,8 +776,12 @@ public:
         if (m_specular_transmittance)
             oss << "  specular_transmittance = " << string::indent(m_specular_transmittance) << ", " << std::endl;
 
-        oss << "  eta = "                    << m_eta << std::endl
-            << "]";
+        oss << "  eta = "                    << m_eta;
+        if (m_film_thickness > 0.f)
+            oss << "," << std::endl
+                << "  film_thickness = "     << m_film_thickness << " nm," << std::endl
+                << "  film_ior = "           << m_film_ior;
+        oss << std::endl << "]";
         return oss.str();
     }
 
@@ -638,10 +792,13 @@ private:
     MicrofacetType m_type;
     ref<Texture> m_alpha_u, m_alpha_v;
     Float m_eta, m_inv_eta;
+    ScalarFloat m_film_thickness;
+    ScalarFloat m_film_ior;
     bool m_sample_visible;
 
     MI_TRAVERSE_CB(Base, m_specular_reflectance, m_specular_transmittance,
-                   m_alpha_u, m_alpha_v, m_eta, m_inv_eta)
+                   m_alpha_u, m_alpha_v, m_eta, m_inv_eta,
+                   m_film_thickness, m_film_ior)
 };
 
 MI_EXPORT_PLUGIN(RoughDielectric)

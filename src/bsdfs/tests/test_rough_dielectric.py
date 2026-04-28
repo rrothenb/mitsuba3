@@ -245,4 +245,52 @@ def test13_attached_sampling(variants_all_ad_rgb):
 
     dr.forward(angle)
     assert dr.allclose(mi.unpolarized_spectrum(dr.grad(weight)), 0.02079637348651886)
-    
+
+
+def test14_thin_film_construct(variant_scalar_rgb):
+    # Film params accepted in non-spectral variants but silently inert.
+    b = mi.load_dict({'type': 'roughdielectric', 'alpha': 0.1,
+                      'film_thickness': 300.0, 'film_ior': 1.38})
+    assert b is not None
+
+    # film_ior accepted as material name.
+    b = mi.load_dict({'type': 'roughdielectric', 'alpha': 0.05,
+                      'film_thickness': 200.0, 'film_ior': 'water'})
+    assert b is not None
+
+    # Negative thickness rejected.
+    with pytest.raises(RuntimeError):
+        mi.load_dict({'type': 'roughdielectric', 'film_thickness': -10.0})
+
+
+def test15_thin_film_spectral(variant_scalar_spectral):
+    """In a spectral variant, an enabled thin film should give a
+    wavelength-dependent reflectance even on a rough microfacet surface."""
+    bsdf_film = mi.load_dict({
+        'type': 'roughdielectric', 'alpha': 0.05, 'int_ior': 1.5,
+        'film_thickness': 400.0, 'film_ior': 2.4,
+    })
+    bsdf_no_film = mi.load_dict({
+        'type': 'roughdielectric', 'alpha': 0.05, 'int_ior': 1.5,
+    })
+
+    si = mi.SurfaceInteraction3f()
+    angle = 30 * dr.pi / 180
+    si.wi = [dr.sin(angle), 0, dr.cos(angle)]
+    si.wavelengths = [430.0, 510.0, 590.0, 670.0]
+
+    ctx = mi.BSDFContext()
+    ctx.type_mask = mi.BSDFFlags.GlossyReflection  # force reflection lobe
+
+    _, w_film    = bsdf_film.sample(ctx, si, 0.0, [0.5, 0.5])
+    _, w_no_film = bsdf_no_film.sample(ctx, si, 0.0, [0.5, 0.5])
+
+    w_no_film_arr = mi.unpolarized_spectrum(w_no_film)
+    w_film_arr    = mi.unpolarized_spectrum(w_film)
+
+    # No-film: reflectance flat across lanes.
+    assert dr.allclose(w_no_film_arr[0], w_no_film_arr[3])
+
+    # Film: clearly varies across lanes.
+    spread = float(dr.max(w_film_arr) - dr.min(w_film_arr))
+    assert spread > 0.05, f'film reflectance should vary; spread={spread}'
