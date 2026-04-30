@@ -372,3 +372,68 @@ def test18_dispersion_transmission_hero_only(variant_scalar_spectral):
     assert dr.allclose(w_arr[1], 0.0)
     assert dr.allclose(w_arr[2], 0.0)
     assert dr.allclose(w_arr[3], 0.0)
+
+
+def test19_dispersion_film_via_instance(variant_scalar_spectral):
+    """Dispersive thin-film BSDFs are pure surface BSDFs with no
+    world-space state, so they should behave identically when accessed
+    through a shape group + instance vs. as a plain shape. This test
+    exercises the most complex code path (microfacet specular + per-λ
+    Fresnel + thin-film Airy + hero-wavelength on dispersive transmission)
+    and verifies the spectral response is preserved through instancing."""
+    bsdf_dict = {
+        'type': 'roughdielectric',
+        'alpha': 0.05,
+        'int_ior': 1.5,
+        'abbe': 25.0,
+        'film_thickness': 400.0,
+        'film_ior': 2.4,
+    }
+
+    # Plain sphere at the origin.
+    scene_plain = mi.load_dict({
+        'type': 'scene',
+        'sphere': {'type': 'sphere', 'bsdf': bsdf_dict},
+    })
+
+    # Same sphere via shape group + instance (identity transform).
+    scene_inst = mi.load_dict({
+        'type': 'scene',
+        'group': {
+            'type': 'shapegroup',
+            'sphere': {'type': 'sphere', 'bsdf': bsdf_dict},
+        },
+        'inst': {
+            'type': 'instance',
+            'group': {'type': 'ref', 'id': 'group'},
+        },
+    })
+
+    ray = mi.Ray3f(o=[0, 0, -3], d=[0, 0, 1], time=0.0,
+                   wavelengths=[430.0, 510.0, 590.0, 670.0])
+    si_plain = scene_plain.ray_intersect(ray)
+    si_inst  = scene_inst.ray_intersect(ray)
+
+    assert si_plain.is_valid()
+    assert si_inst.is_valid()
+    assert si_inst.instance is not None  # confirm we hit an instance
+    assert si_plain.instance is None     # plain shape has no instance
+
+    bsdf_p = si_plain.bsdf()
+    bsdf_i = si_inst.bsdf()
+
+    ctx = mi.BSDFContext()
+    ctx.type_mask = mi.BSDFFlags.GlossyReflection
+    _, w_p = bsdf_p.sample(ctx, si_plain, 0.0, [0.5, 0.5])
+    _, w_i = bsdf_i.sample(ctx, si_inst, 0.0, [0.5, 0.5])
+
+    w_p_arr = mi.unpolarized_spectrum(w_p)
+    w_i_arr = mi.unpolarized_spectrum(w_i)
+
+    # Sanity: the thin-film + dispersion combo really did vary across λ.
+    spread = float(dr.max(w_p_arr) - dr.min(w_p_arr))
+    assert spread > 0.05, f'thin-film + dispersion should vary by λ; spread={spread}'
+
+    # Spectral BSDF response must be preserved through instancing.
+    assert dr.allclose(w_p_arr, w_i_arr, atol=1e-4), \
+        f'instance should preserve spectral BSDF response: plain={w_p_arr} inst={w_i_arr}'
