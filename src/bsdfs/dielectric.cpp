@@ -645,9 +645,23 @@ public:
                        Reflection: all wavelengths share the sampled direction, so each
                        lane receives r_λ / r_hero. Transmission: only the hero wavelength
                        refracts into the sampled direction — the other lanes are killed. */
-                    UnpolarizedSpectrum w_r = r_i_spec / dr::detach(r_i);
+                    /* Guard against thin-film resonances where r_i (or
+                       t_i = 1 - r_i) approaches zero — direct division
+                       would produce NaN/inf and corrupt the path. When
+                       the sampling pdf is below threshold, we accept the
+                       tiny bias of zeroing the contribution rather than
+                       letting NaN propagate through MIS / volumetric
+                       transport. */
+                    Float det_r = dr::detach(r_i),
+                          det_t = dr::detach(t_i);
+                    UnpolarizedSpectrum w_r = dr::select(
+                        det_r > 1e-6f,
+                        r_i_spec / dr::maximum(det_r, 1e-6f),
+                        UnpolarizedSpectrum(0.f));
                     UnpolarizedSpectrum w_t = dr::zeros<UnpolarizedSpectrum>();
-                    w_t[0] = t_i_spec[0] / dr::detach(t_i);
+                    w_t[0] = dr::select(det_t > 1e-6f,
+                                        t_i_spec[0] / dr::maximum(det_t, 1e-6f),
+                                        Float(0.f));
                     weight = dr::select(selected_r, Spectrum(w_r), Spectrum(w_t));
                 }
             } else if (has_reflection || has_transmission) {

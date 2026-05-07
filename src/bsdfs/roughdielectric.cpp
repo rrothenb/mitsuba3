@@ -517,14 +517,29 @@ public:
                    dispersion, only the hero wavelength refracts in this
                    direction — mask non-hero lanes to zero. Without dispersion,
                    substrate IOR is constant and all wavelengths transmit
-                   together. */
-                UnpolarizedSpectrum w_r = F_spec / dr::detach(F);
+                   together.
+
+                   Guard against thin-film resonances where F (or 1 - F)
+                   approaches zero — direct division would produce NaN and
+                   corrupt the path through MIS / volumetric transport. */
+                Float det_F = dr::detach(F),
+                      det_T = dr::detach(1.f - F);
+                UnpolarizedSpectrum w_r = dr::select(
+                    det_F > 1e-6f,
+                    F_spec / dr::maximum(det_F, 1e-6f),
+                    UnpolarizedSpectrum(0.f));
                 UnpolarizedSpectrum w_t;
                 if (has_dispersion()) {
                     w_t = dr::zeros<UnpolarizedSpectrum>();
-                    w_t[0] = (1.f - F_spec[0]) / dr::detach(1.f - F);
+                    w_t[0] = dr::select(
+                        det_T > 1e-6f,
+                        (1.f - F_spec[0]) / dr::maximum(det_T, 1e-6f),
+                        Float(0.f));
                 } else {
-                    w_t = (1.f - F_spec) / dr::detach(1.f - F);
+                    w_t = dr::select(
+                        det_T > 1e-6f,
+                        (1.f - F_spec) / dr::maximum(det_T, 1e-6f),
+                        UnpolarizedSpectrum(0.f));
                 }
                 weight = dr::select(selected_r, w_r, w_t);
             }

@@ -457,7 +457,13 @@ public:
             dr::masked(bs.sampled_component, sample_specular) = 0;
             dr::masked(bs.sampled_type, sample_specular) = +BSDFFlags::DeltaReflection;
 
-            UnpolarizedSpectrum value = r_in_spec / bs.pdf;
+            /* Guard against thin-film resonances where the hero F (driving
+               prob_specular) approaches zero — direct division by bs.pdf
+               would produce NaN and corrupt the path. */
+            UnpolarizedSpectrum value = dr::select(
+                bs.pdf > 1e-6f,
+                r_in_spec / dr::maximum(bs.pdf, 1e-6f),
+                UnpolarizedSpectrum(0.f));
             if (m_specular_reflectance)
                 value *= m_specular_reflectance->eval(si, sample_specular);
             result[sample_specular] = value;
@@ -488,7 +494,14 @@ public:
 
             UnpolarizedSpectrum value = m_diffuse_reflectance->eval(si, sample_diffuse);
             value /= 1.f - (m_nonlinear ? (value * m_fdr_int) : m_fdr_int);
-            value *= inv_eta_2_spec * (1.f - r_in_spec) * (1.f - r_out_spec) / prob_diffuse;
+            // Same guard as the specular branch: prob_diffuse can approach
+            // zero when thin-film resonance pushes hero F to ~1.
+            UnpolarizedSpectrum scaled = dr::select(
+                prob_diffuse > 1e-6f,
+                inv_eta_2_spec * (1.f - r_in_spec) * (1.f - r_out_spec) /
+                    dr::maximum(prob_diffuse, 1e-6f),
+                UnpolarizedSpectrum(0.f));
+            value *= scaled;
             result[sample_diffuse] = value;
         }
 

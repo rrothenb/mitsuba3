@@ -437,3 +437,44 @@ def test19_dispersion_film_via_instance(variant_scalar_spectral):
     # Spectral BSDF response must be preserved through instancing.
     assert dr.allclose(w_p_arr, w_i_arr, atol=1e-4), \
         f'instance should preserve spectral BSDF response: plain={w_p_arr} inst={w_i_arr}'
+
+
+def test20_thin_film_resonance_no_nan(variant_scalar_spectral):
+    """Regression: a roughdielectric with thin-film parameters that produce
+    destructive interference (F → 0) on the hero wavelength must not
+    generate NaN sample weights. The previous code divided F_spec by
+    dr::detach(F) directly, which produced NaN when F was near zero at
+    Airy resonances — those NaNs then propagated through MIS / volumetric
+    transport and corrupted ~30% of pixels in long renders. The fix
+    guards the division with dr::select."""
+    # Parameters approximate an AR-coating sweet spot: film_ior ≈ √(n_a·n_s)
+    # at ~138 nm on glass produces near-zero reflectance near 550 nm.
+    bsdf = mi.load_dict({
+        'type': 'roughdielectric',
+        'alpha': 0.05,
+        'int_ior': 1.5,
+        'film_thickness': 138.0,
+        'film_ior': 1.225,
+    })
+
+    # Sweep incident angle and wavelength packets to hit the resonance from
+    # multiple directions. Even a single NaN is a regression.
+    rng = dr.opaque
+    ctx = mi.BSDFContext()
+    for angle_deg in [5.0, 25.0, 45.0, 65.0, 80.0]:
+        a = angle_deg * dr.pi / 180
+        si = mi.SurfaceInteraction3f()
+        si.wi = [dr.sin(a), 0, dr.cos(a)]
+        # Pick wavelengths spanning the expected R≈0 region.
+        for wls in ([430., 510., 550., 670.],
+                    [380., 450., 555., 720.],
+                    [400., 500., 600., 700.]):
+            si.wavelengths = wls
+            for sample1 in [0.0, 0.25, 0.5, 0.75, 1.0]:
+                for u, v in [(0.1, 0.1), (0.5, 0.5), (0.9, 0.9)]:
+                    bs, w = bsdf.sample(ctx, si, sample1, [u, v])
+                    arr = mi.unpolarized_spectrum(w)
+                    for i in range(4):
+                        assert dr.all(dr.isfinite(arr[i])), \
+                            (f'NaN/Inf at angle={angle_deg}° λ={wls} '
+                             f'sample1={sample1} uv=({u},{v}): w={arr}')
